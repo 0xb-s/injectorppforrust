@@ -1,7 +1,7 @@
 use injectorpp::interface::injector::*;
 
 async fn simple_async_func_u32_add_one(x: u32) -> u32 {
-    x + 1
+    x + 1 +2
 }
 
 async fn simple_async_func_u32_add_two(x: u32) -> u32 {
