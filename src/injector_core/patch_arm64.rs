@@ -178,24 +178,34 @@ fn apply_branch_patch(
 
 
 
-// Linux-only preflight helpers (only these are OS-gated)
+// ================= Linux-only preflight helpers (AArch64) =================
+
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-unsafe fn assert_min_patch_window_or_panic(src: &crate::injector_core::common::FuncPtrInternal, patch_size: usize) {
+unsafe fn assert_min_patch_window_or_panic(
+    src: &crate::injector_core::common::FuncPtrInternal,
+    patch_size: usize,
+) {
     assert!(
         patch_size % 4 == 0,
         "PATCH_SIZE must be a multiple of 4 on AArch64 (got {patch_size})"
     );
 
     // Read exactly what we intend to overwrite.
-    let buf = crate::injector_core::patch_arm64::read_bytes(src.as_ptr() as *mut u8, patch_size);
+    let buf = crate::injector_core::utils::read_bytes(src.as_ptr() as *mut u8, patch_size);
 
     for (idx, chunk) in buf.chunks_exact(4).enumerate() {
         let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
 
-        // Treat ONLY RET and BR Xn as hard non-fallthrough terminators.
-        // Do NOT treat `B imm26` as a stop — veneers often branch early
-        // and it's safe to overwrite the entry regardless.
-        if is_a64_ret(w) || is_a64_br_reg(w) {
+        // Allow a top-of-entry veneer (unconditional B) at +0 only.
+        if idx == 0 && is_a64_b_uncond_imm(w) {
+            continue;
+        }
+
+        // Refuse to patch if we see any hard, non-fallthrough terminators:
+        //  - RET anywhere in the patch window
+        //  - BR Xn anywhere in the patch window (indirect tail)
+        //  - B imm26 if it appears after the first instruction
+        if is_a64_ret(w) || is_a64_br_reg(w) || is_a64_b_uncond_imm(w) {
             let at = idx * 4;
             panic!(
                 "Target function too small: terminator in first {patch_size} bytes (at +{:#x}). \
@@ -209,7 +219,7 @@ unsafe fn assert_min_patch_window_or_panic(src: &crate::injector_core::common::F
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 #[inline]
 fn is_a64_ret(w: u32) -> bool {
-    // 1101 0110 0101 1111 0000 00 Rn 00000  (RET Xn)
+    // RET Xn: 1101 0110 0101 1111 0000 00 Rn 00000
     const MASK: u32 = 0xFFFF_FC1F;
     const BASE: u32 = 0xD65F_0000;
     (w & MASK) == BASE
@@ -218,8 +228,16 @@ fn is_a64_ret(w: u32) -> bool {
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 #[inline]
 fn is_a64_br_reg(w: u32) -> bool {
-    // 1101 0110 0001 1111 0000 00 Rn 00000  (BR Xn)
+    // BR Xn: 1101 0110 0001 1111 0000 00 Rn 00000
     const MASK: u32 = 0xFFFF_FC1F;
     const BASE: u32 = 0xD61F_0000;
     (w & MASK) == BASE
 }
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[inline]
+fn is_a64_b_uncond_imm(w: u32) -> bool {
+    // B imm26: top 6 bits == 000101
+    (w & 0x7C00_0000) == 0x1400_0000
+}
+
