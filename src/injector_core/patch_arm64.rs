@@ -5,6 +5,7 @@ use crate::injector_core::common::*;
 use crate::injector_core::patch_trait::*;
 use crate::injector_core::utils::*;
 
+/// Patch implementation for AArch64 with a preflight size/terminator check to avoid UB.
 pub(crate) struct PatchArm64;
 
 impl PatchTrait for PatchArm64 {
@@ -12,10 +13,14 @@ impl PatchTrait for PatchArm64 {
         src: FuncPtrInternal,
         target: FuncPtrInternal,
     ) -> PatchGuard {
-        const PATCH_SIZE: usize = 12;
-        const JIT_SIZE: usize = 20;
+        const PATCH_SIZE: usize = 12; // we overwrite 3 full A64 instructions
+        const JIT_SIZE: usize   = 20; // movz/movk/movk/movk + br (5 * 4B)
+
+        // Ensure first 12B at entry are safe to clobber.
+        assert_min_patch_window_or_panic(src, PATCH_SIZE);
 
         let original_bytes = unsafe { read_bytes(src.as_ptr() as *mut u8, PATCH_SIZE) };
+
         let jit_memory = allocate_jit_memory(&src, JIT_SIZE);
         generate_will_execute_jit_code_abs(jit_memory, target.as_ptr());
 
@@ -23,15 +28,73 @@ impl PatchTrait for PatchArm64 {
     }
 
     fn replace_function_return_boolean(src: FuncPtrInternal, value: bool) -> PatchGuard {
-        const PATCH_SIZE: usize = 12;
-        const JIT_SIZE: usize = 8;
+        const PATCH_SIZE: usize = 12; // keep the same entry patch size
+        const JIT_SIZE: usize   = 8;  // movz w0,imm ; ret
+
+        assert_min_patch_window_or_panic(src, PATCH_SIZE);
 
         let original_bytes = unsafe { read_bytes(src.as_ptr() as *mut u8, PATCH_SIZE) };
+
         let jit_memory = allocate_jit_memory(&src, JIT_SIZE);
         generate_will_return_boolean_jit_code(jit_memory, value);
 
         apply_branch_patch(src, jit_memory, JIT_SIZE, &original_bytes)
     }
+}
+
+// ---------- Preflight guard (size/terminator check) ----------
+
+/// Panic early if the first `patch_size` bytes contain a **non-fallthrough**
+/// terminator. Overwriting beyond that would clobber non-function bytes → UB.
+fn assert_min_patch_window_or_panic(src: FuncPtrInternal, patch_size: usize) {
+    assert!(
+        patch_size % 4 == 0,
+        "PATCH_SIZE must be a multiple of 4 on AArch64 (got {patch_size})"
+    );
+
+    // Read exactly what we plan to overwrite.
+    let buf = unsafe { read_bytes(src.as_ptr() as *mut u8, patch_size) };
+
+    for (idx, inst) in buf.chunks_exact(4).enumerate() {
+        let w = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
+
+        // Hard non-fallthroughs at entry we will not straddle.
+        if is_a64_ret(w) || is_a64_br_reg(w) || is_a64_b_uncond_imm(w) {
+            // If you want to be even stricter, also treat BRK/HLT/ERET/DRPS as terminal:
+            // || is_a64_brk(w) || is_a64_hlt(w) || is_a64_eret(w) || is_a64_drps(w)
+            let at = idx * 4;
+            panic!(
+                "Target function too small: terminator in first {patch_size} bytes \
+                 (at +{:#x}). Refusing to patch to avoid UB.",
+                at
+            );
+        }
+    }
+}
+
+/// RET Xn
+#[inline]
+fn is_a64_ret(w: u32) -> bool {
+    // 1101 0110 0101 1111 0000 00 Rn 00000
+    const MASK: u32 = 0xFFFF_FC1F;
+    const BASE: u32 = 0xD65F_0000;
+    (w & MASK) == BASE
+}
+
+/// BR Xn (indirect branch)
+#[inline]
+fn is_a64_br_reg(w: u32) -> bool {
+    // 1101 0110 0001 1111 0000 00 Rn 00000
+    const MASK: u32 = 0xFFFF_FC1F;
+    const BASE: u32 = 0xD61F_0000;
+    (w & MASK) == BASE
+}
+
+/// Unconditional B imm26 (direct tail jump, no fallthrough)
+#[inline]
+fn is_a64_b_uncond_imm(w: u32) -> bool {
+    // Top 6 bits == 000101
+    (w & 0x7C00_0000) == 0x1400_0000
 }
 
 /// Generates a 16-byte JIT code block that loads the absolute address of `target`
