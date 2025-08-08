@@ -5,7 +5,6 @@ use crate::injector_core::common::*;
 use crate::injector_core::patch_trait::*;
 use crate::injector_core::utils::*;
 
-/// Patch implementation for AArch64 with a preflight size/terminator check to avoid UB.
 pub(crate) struct PatchArm64;
 
 impl PatchTrait for PatchArm64 {
@@ -13,14 +12,15 @@ impl PatchTrait for PatchArm64 {
         src: FuncPtrInternal,
         target: FuncPtrInternal,
     ) -> PatchGuard {
-        const PATCH_SIZE: usize = 12; // we overwrite 3 full A64 instructions
-        const JIT_SIZE: usize   = 20; // movz/movk/movk/movk + br (5 * 4B)
+        const PATCH_SIZE: usize = 12;
+        const JIT_SIZE: usize = 20;
 
-        // Ensure first 12B at entry are safe to clobber.
-        assert_min_patch_window_or_panic(src, PATCH_SIZE);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        unsafe {
+            assert_min_patch_window_or_panic(&src, PATCH_SIZE);
+        }
 
         let original_bytes = unsafe { read_bytes(src.as_ptr() as *mut u8, PATCH_SIZE) };
-
         let jit_memory = allocate_jit_memory(&src, JIT_SIZE);
         generate_will_execute_jit_code_abs(jit_memory, target.as_ptr());
 
@@ -28,13 +28,16 @@ impl PatchTrait for PatchArm64 {
     }
 
     fn replace_function_return_boolean(src: FuncPtrInternal, value: bool) -> PatchGuard {
-        const PATCH_SIZE: usize = 12; // keep the same entry patch size
-        const JIT_SIZE: usize   = 8;  // movz w0,imm ; ret
+        const PATCH_SIZE: usize = 12;
+        const JIT_SIZE: usize = 8;
 
-        assert_min_patch_window_or_panic(src, PATCH_SIZE);
+        // NEW: Linux-only preflight guard.
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        unsafe {
+            assert_min_patch_window_or_panic(&src, PATCH_SIZE);
+        }
 
         let original_bytes = unsafe { read_bytes(src.as_ptr() as *mut u8, PATCH_SIZE) };
-
         let jit_memory = allocate_jit_memory(&src, JIT_SIZE);
         generate_will_return_boolean_jit_code(jit_memory, value);
 
@@ -42,70 +45,8 @@ impl PatchTrait for PatchArm64 {
     }
 }
 
-// ---------- Preflight guard (size/terminator check) ----------
-
-/// Panic early if the first `patch_size` bytes contain a **non-fallthrough**
-/// terminator. Overwriting beyond that would clobber non-function bytes → UB.
-fn assert_min_patch_window_or_panic(src: FuncPtrInternal, patch_size: usize) {
-    assert!(
-        patch_size % 4 == 0,
-        "PATCH_SIZE must be a multiple of 4 on AArch64 (got {patch_size})"
-    );
-
-    // Read exactly what we plan to overwrite.
-    let buf = unsafe { read_bytes(src.as_ptr() as *mut u8, patch_size) };
-
-    for (idx, inst) in buf.chunks_exact(4).enumerate() {
-        let w = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
-
-        // Hard non-fallthroughs at entry we will not straddle.
-        if is_a64_ret(w) || is_a64_br_reg(w) || is_a64_b_uncond_imm(w) {
-            // If you want to be even stricter, also treat BRK/HLT/ERET/DRPS as terminal:
-            // || is_a64_brk(w) || is_a64_hlt(w) || is_a64_eret(w) || is_a64_drps(w)
-            let at = idx * 4;
-            panic!(
-                "Target function too small: terminator in first {patch_size} bytes \
-                 (at +{:#x}). Refusing to patch to avoid UB.",
-                at
-            );
-        }
-    }
-}
-
-/// RET Xn
-#[inline]
-fn is_a64_ret(w: u32) -> bool {
-    // 1101 0110 0101 1111 0000 00 Rn 00000
-    const MASK: u32 = 0xFFFF_FC1F;
-    const BASE: u32 = 0xD65F_0000;
-    (w & MASK) == BASE
-}
-
-/// BR Xn (indirect branch)
-#[inline]
-fn is_a64_br_reg(w: u32) -> bool {
-    // 1101 0110 0001 1111 0000 00 Rn 00000
-    const MASK: u32 = 0xFFFF_FC1F;
-    const BASE: u32 = 0xD61F_0000;
-    (w & MASK) == BASE
-}
-
-/// Unconditional B imm26 (direct tail jump, no fallthrough)
-#[inline]
-fn is_a64_b_uncond_imm(w: u32) -> bool {
-    // Top 6 bits == 000101
-    (w & 0x7C00_0000) == 0x1400_0000
-}
-
-/// Generates a 16-byte JIT code block that loads the absolute address of `target`
-/// into register X9 (using a MOVZ and two MOVK instructions) and then branches to X9.
-/// This avoids branch-range limitations.
-///
-/// The generated instructions are:
-///   movz x9, #imm0, lsl #0
-///   movk x9, #imm1, lsl #16
-///   movk x9, #imm2, lsl #32
-///   br x9
+/// Generates a 20-byte JIT code block that loads the absolute address of `target`
+/// into X9 (MOVZ + 3×MOVK) and then branches to X9 (BR).
 fn generate_will_execute_jit_code_abs(jit_ptr: *mut u8, target: *const ()) {
     let target_addr = target as usize as u64;
 
@@ -127,7 +68,6 @@ fn generate_will_execute_jit_code_abs(jit_ptr: *mut u8, target: *const ()) {
     // BR x9
     let br = emit_br(register_name);
 
-    // Write instructions in the correct order: bottom-up so no overwrite
     let mut asm_code: Vec<u8> = Vec::new();
     append_instruction(&mut asm_code, bool_array_to_u32(movz));
     append_instruction(&mut asm_code, bool_array_to_u32(movk1));
@@ -140,9 +80,8 @@ fn generate_will_execute_jit_code_abs(jit_ptr: *mut u8, target: *const ()) {
     }
 }
 
-/// Generates a 16-byte JIT code block that returns the specified boolean.
+/// Generates an 8-byte JIT block that returns the specified boolean.
 /// The code moves the immediate into w0 and then returns.
-/// Two NOPs are added for padding.
 fn generate_will_return_boolean_jit_code(jit_ptr: *mut u8, value: bool) {
     let mut asm_code = [0u8; 8]; // 2 instructions = 2 * 4
     let mut cursor = 0;
@@ -189,6 +128,7 @@ fn apply_branch_patch(
 
     let mut patch = [0u8; PATCH_SIZE];
 
+    // macOS path: your existing long-jump helper.
     #[cfg(target_os = "macos")]
     {
         let instrs = maybe_emit_long_jump(func_addr, jit_addr);
@@ -203,16 +143,21 @@ fn apply_branch_patch(
         }
     }
 
+    // Non-macOS: use B imm26 if in range (±128 MiB), else panic.
     #[cfg(not(target_os = "macos"))]
     {
-        const BRANCH_RANGE: std::ops::RangeInclusive<isize> = -0x2000000..=0x1FFF_FFFF; // ±32MB
+        // imm26 is a signed word offset (×4): range = [-2^25, 2^25-1] words → ±128 MiB.
+        const MIN_WORDS: isize = -(1isize << 25);
+        const MAX_WORDS: isize = (1isize << 25) - 1;
 
-        let offset = (jit_addr as isize - func_addr as isize) / 4;
-        if !BRANCH_RANGE.contains(&offset) {
-            panic!("JIT memory is out of branch range: offset = {offset}, expected ±32MB");
+        let offset_words = (jit_addr as isize - func_addr as isize) / 4;
+        if offset_words < MIN_WORDS || offset_words > MAX_WORDS {
+            panic!(
+                "JIT memory is out of branch range for `B imm26`: offset_words = {offset_words}, expected ±2^25 words (±128 MiB)"
+            );
         }
 
-        let branch_instr: u32 = 0x14000000 | ((offset as u32) & 0x03FF_FFFF);
+        let branch_instr: u32 = 0x14000000 | ((offset_words as u32) & 0x03FF_FFFF);
         patch[0..4].copy_from_slice(&branch_instr.to_le_bytes());
         patch[4..8].copy_from_slice(&NOP.to_le_bytes());
         patch[8..12].copy_from_slice(&NOP.to_le_bytes());
@@ -229,4 +174,50 @@ fn apply_branch_patch(
         jit_memory,
         jit_size,
     )
+}
+
+
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+unsafe fn assert_min_patch_window_or_panic(src: &FuncPtrInternal, patch_size: usize) {
+    assert!(
+        patch_size % 4 == 0,
+        "PATCH_SIZE must be a multiple of 4 on AArch64 (got {patch_size})"
+    );
+
+    let buf = read_bytes(src.as_ptr() as *mut u8, patch_size);
+
+    for (idx, chunk) in buf.chunks_exact(4).enumerate() {
+        let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+
+        if is_a64_ret(w) || is_a64_br_reg(w) || is_a64_b_uncond_imm(w) {
+            let at = idx * 4;
+            panic!(
+                "Target function too small: terminator in first {patch_size} bytes (at +{:#x}). Refusing to patch to avoid UB.",
+                at
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[inline]
+fn is_a64_ret(w: u32) -> bool {
+    const MASK: u32 = 0xFFFF_FC1F;
+    const BASE: u32 = 0xD65F_0000; // RET Xn
+    (w & MASK) == BASE
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[inline]
+fn is_a64_br_reg(w: u32) -> bool {
+    const MASK: u32 = 0xFFFF_FC1F;
+    const BASE: u32 = 0xD61F_0000; // BR Xn
+    (w & MASK) == BASE
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[inline]
+fn is_a64_b_uncond_imm(w: u32) -> bool {
+    (w & 0x7C00_0000) == 0x1400_0000 // B imm26 (unconditional)
 }
