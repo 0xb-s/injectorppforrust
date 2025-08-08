@@ -191,7 +191,7 @@ unsafe fn assert_min_patch_window_or_panic(
     );
 
     // Read exactly what we intend to overwrite.
-    let buf = crate::injector_core::utils::read_bytes(src.as_ptr() as *mut u8, patch_size);
+    let buf = read_bytes(src.as_ptr() as *mut u8, patch_size);
 
     for (idx, chunk) in buf.chunks_exact(4).enumerate() {
         let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
